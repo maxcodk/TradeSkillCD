@@ -1,0 +1,9 @@
+## Interface: 11200
+## Title: |cff3fcf26TradeSkillCD|r  |cfff05cdc-Svarrog-|r
+## Notes: Tracks profession cooldowns (Alchemy, Tailoring, Leatherworking). No pfUI dependency. Syncs data across accounts via SuperWoW if installed.
+## Author: Svarrog
+## Version: 1.0
+## SavedVariables: TSCD_DB
+## SavedVariablesPerCharacter: TSCD_CFG
+
+TradeSkillCD.lua
