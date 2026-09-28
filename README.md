@@ -99,8 +99,7 @@ tracked cooldown just expired. When one does, you'll get:
 ## Look & feel
 
 Chat output is deliberately neutral: soft white and grey text, with a
-muted green for "ready" and a muted red for "off"/errors. The pink
-accent is used only for a few titles (help and status headers).
+muted green for "ready" and a muted red for "off"/errors. 
 
 `/tscd status` lists each character on its own line with their
 professions indented underneath, the current character first, then the
