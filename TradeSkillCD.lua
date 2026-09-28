@@ -8,9 +8,9 @@
    1. Fully standalone addon. Data is stored in its own SavedVariables
       file (TSCD_DB), which the client automatically writes to
       WTF/Account/<ACCOUNT>/SavedVariables/TradeSkillCD.lua.
-      No dependency on pfUI - if pfUI happens to be loaded, the addon
-      will additionally hook a tooltip onto the pfUI clock widget, but
-      that is purely optional.
+      No dependency on pfUI - if pfUI is installed, the addon also
+      appends the cooldown list to the tooltip of pfUI's clock widget,
+      but that is purely optional.
    2. If SuperWoW (https://github.com/balakethelock/SuperWoW) is
       installed, the addon also reads/writes a shared file through
       SuperWoW's global ImportFile/ExportFile functions. That file
@@ -19,10 +19,10 @@
       the same trick FullSack (Otari98) uses for cross-account data.
       Without SuperWoW the addon still works fine, just scoped to a
       single account.
-   3. Everything happens through chat slash commands (/tscd ...). The
-      main event handler runs inside pcall, so a problem in any single
-      event can only print a diagnostic message instead of silently
-      breaking the rest of the addon.
+   3. Everything else happens through chat slash commands (/tscd ...).
+      The main event handler runs inside pcall, so a problem in any
+      single event can only print a diagnostic message instead of
+      silently breaking the rest of the addon.
    4. Tool items with a passive, icon-only cooldown (Salt Shaker etc.)
       are detected automatically: bag/bank changes are watched and,
       shortly after, the addon quietly checks the tracked tool items'
@@ -35,18 +35,18 @@ local SHARED_FILE = "TradeSkillCD_Shared" -- shared file name for ExportFile/Imp
 -------------------------------------------------------------------
 -- Colors / formatting
 --
--- Soft, muted paladin-pink theme for the addon's own branding/headers;
--- functional colors (ready/off/etc.) stay close to their usual meaning
--- so status output stays easy to scan at a glance.
+-- Deliberately neutral: soft whites and greys for almost everything,
+-- muted green/red only where they carry meaning (ready / on / off /
+-- error). The paladin-pink accent is reserved for a few titles.
 -------------------------------------------------------------------
 
 local colors = {
-  pink  = "|cffe08cb4", -- brand color: addon name, headers, section titles
-  rose  = "|cffcf9fb2", -- softer pink, used for secondary accents
-  green = "|cff59c98a", -- ready / on
-  red   = "|cffe0736b", -- off / error
-  white = "|cfff2e6ec", -- warm-white body text
-  grey  = "|cff9c8b93", -- muted secondary text (timestamps, hints)
+  pink  = "|cffe08cb4", -- accent: titles/headers only
+  green = "|cff6fbf8f", -- ready / on
+  red   = "|cffd9827b", -- off / error
+  white = "|cffe6e6e6", -- primary text
+  grey  = "|cff9a9a9a", -- secondary text
+  dim   = "|cff666666", -- separators, timestamps
 }
 
 local function C(color, text)
@@ -54,10 +54,16 @@ local function C(color, text)
   return colors[color] .. text .. "|r"
 end
 
-local MSG_PREFIX = C("pink", "TradeSkillCD") .. C("grey", " » ")
+local MSG_PREFIX = C("grey", "TSCD") .. C("dim", " » ")
 
+-- Message with the addon prefix
 local function Print(msg)
   DEFAULT_CHAT_FRAME:AddMessage(MSG_PREFIX .. msg)
+end
+
+-- Message without prefix (used for indented body lines)
+local function Raw(msg)
+  DEFAULT_CHAT_FRAME:AddMessage(msg)
 end
 
 -- Formats a remaining duration as "Xd Yh" / "Xh Ym" / "Xm Ys"
@@ -80,18 +86,16 @@ local function FormatDuration(seconds)
   end
 end
 
--- Absolute "ready at" timestamp, used in /tscd status
-local function FormatAbsolute(ts)
-  if ts == 0 then return C("green", "ready") end
-  return date("%d.%m %H:%M", ts)
-end
-
 -------------------------------------------------------------------
 -- Player / realm
 -------------------------------------------------------------------
 
 local player_name = UnitName("player")
 local realm_name  = GetRealmName()
+
+local function IsCurrent(realm, char)
+  return char == player_name and realm == realm_name
+end
 
 -------------------------------------------------------------------
 -- Profession list and cooldown-marker items
@@ -239,7 +243,7 @@ local function SetCooldown(prof_index, seconds_from_now)
   local now = time()
   TSCD_DB[realm_name][player_name][prof_index] = { ready = now + seconds_from_now, updated = now }
   if TSCD_CFG.noti_chat then
-    Print(C("rose", tradeskill_list[prof_index].name) .. " is now on cooldown: " .. FormatDuration(seconds_from_now))
+    Print(C("white", tradeskill_list[prof_index].name) .. C("grey", " is now on cooldown: ") .. FormatDuration(seconds_from_now))
   end
   RecomputeNextCheck()
 end
@@ -269,13 +273,13 @@ local function MarkReady(realm, char, prof_index, announce)
   TSCD_DB[realm][char][prof_index].ready = 0
   TSCD_DB[realm][char][prof_index].updated = time()
   if announce then
-    local who = (char == player_name and realm == realm_name) and "" or (C("grey", char .. " » "))
-    Print(who .. C("rose", tradeskill_list[prof_index].name) .. ": " .. C("green", "ready!"))
+    local who = IsCurrent(realm, char) and "" or (C("white", char) .. C("dim", " · "))
+    Print(who .. C("white", tradeskill_list[prof_index].name) .. C("grey", ": ") .. C("green", "ready!"))
     if TSCD_CFG.noti_sound then
       PlaySound("LEVELUP")
     end
-    if TSCD_CFG.noti_rw and char == player_name and realm == realm_name then
-      UIErrorsFrame:AddMessage(MSG_PREFIX .. tradeskill_list[prof_index].name .. " ready!", 0.94, 0.65, 0.80)
+    if TSCD_CFG.noti_rw and IsCurrent(realm, char) then
+      UIErrorsFrame:AddMessage(tradeskill_list[prof_index].name .. " ready!", 0.65, 0.9, 0.75)
     end
   end
 end
@@ -315,7 +319,7 @@ local function ManualTradeskillCheck(only_index)
           EnsurePath(realm_name, player_name)
           TSCD_DB[realm_name][player_name][i] = { ready = now + cd, updated = now }
           if TSCD_CFG.noti_chat then
-            Print(C("rose", tradeskill_list[i].name) .. " cooldown: " .. FormatDuration(cd))
+            Print(C("white", tradeskill_list[i].name) .. C("grey", " cooldown: ") .. FormatDuration(cd))
           end
         end
       end
@@ -455,66 +459,191 @@ end
 tick_frame:SetScript("OnUpdate", UpdateTicker)
 
 -------------------------------------------------------------------
--- Status on request
+-- Character list + status output
 -------------------------------------------------------------------
 
-local function PrintStatus(only_self)
-  local printed = false
-  Print(C("pink", "── cooldown status ──"))
+-- Every known character as {realm=, char=}: current character first,
+-- then the rest of the current realm, then other realms - alphabetical
+-- within each group, so the output order is always stable.
+local function CollectCharacters()
+  local list = {}
   for realm in TSCD_DB do
     for char in TSCD_DB[realm] do
-      if not only_self or (char == player_name and realm == realm_name) then
-        local shown_char = false
-        for prof in tradeskill_list do
-          local e = TSCD_DB[realm][char][prof]
-          if type(e) == "table" then
-            if not only_self and not shown_char then
-              local label = (char == player_name and realm == realm_name) and C("pink", char) or C("white", char)
-              Print(label)
-              shown_char = true
-            end
-            local remaining = e.ready == 0 and 0 or (e.ready - time())
-            local indent = only_self and "" or "   "
-            Print(indent .. C("rose", " " .. tradeskill_list[prof].name) .. ": " .. FormatDuration(remaining) ..
-                  C("grey", "  (" .. FormatAbsolute(e.ready) .. ")"))
-            printed = true
+      table.insert(list, { realm = realm, char = char })
+    end
+  end
+  table.sort(list, function(a, b)
+    local a_me = IsCurrent(a.realm, a.char)
+    local b_me = IsCurrent(b.realm, b.char)
+    if a_me ~= b_me then return a_me end
+    local a_here = (a.realm == realm_name)
+    local b_here = (b.realm == realm_name)
+    if a_here ~= b_here then return a_here end
+    if a.realm ~= b.realm then return a.realm < b.realm end
+    return a.char < b.char
+  end)
+  return list
+end
+
+-- Rows {name=, remaining=, ready_at=} for one character, in fixed profession order
+local function CollectRows(realm, char)
+  local rows = {}
+  for prof = 1, table.getn(tradeskill_list) do
+    local e = TSCD_DB[realm][char][prof]
+    if type(e) == "table" and e.ready then
+      local remaining = 0
+      if e.ready ~= 0 then remaining = e.ready - time() end
+      table.insert(rows, { name = tradeskill_list[prof].name, remaining = remaining, ready_at = e.ready })
+    end
+  end
+  return rows
+end
+
+local function CharacterLabel(realm, char)
+  local label = C("white", char)
+  if realm ~= realm_name then
+    label = label .. C("dim", " (" .. realm .. ")")
+  end
+  return label
+end
+
+-- Prints cooldowns for every known character (only_self = current one only)
+local function PrintStatus(only_self)
+  local list = CollectCharacters()
+  local printed = false
+  Print(C("pink", "Cooldown status"))
+  for i = 1, table.getn(list) do
+    local entry = list[i]
+    if not only_self or IsCurrent(entry.realm, entry.char) then
+      local rows = CollectRows(entry.realm, entry.char)
+      if table.getn(rows) > 0 then
+        printed = true
+        Raw("  " .. CharacterLabel(entry.realm, entry.char))
+        for r = 1, table.getn(rows) do
+          local row = rows[r]
+          local line = "     " .. C("grey", row.name) .. C("dim", " · ") .. FormatDuration(row.remaining)
+          if row.remaining > 0 then
+            line = line .. C("dim", "  " .. date("%d.%m %H:%M", row.ready_at))
           end
+          Raw(line)
         end
       end
     end
   end
   if not printed then
-    Print(C("grey", "no data yet - run ") .. C("pink", "/tscd scan"))
+    Print(C("grey", "no data yet - run ") .. C("white", "/tscd scan"))
   end
 end
 
 -------------------------------------------------------------------
--- Optional pfUI integration (only if pfUI is loaded)
+-- Optional pfUI integration: cooldowns in the clock widget's tooltip
+--
+-- How pfUI wires that tooltip (see modules/panel.lua): the clock
+-- widget's Tooltip function is bound ONCE to the panel button's
+-- OnEnter script the first time the clock updates, and never re-read
+-- afterwards. Replacing widget.Tooltip later therefore does nothing -
+-- the already-bound OnEnter has to be wrapped instead. We do both:
+--   * wrap the OnEnter of the panel button that shows the clock
+--   * wrap widget.Tooltip too, in case something binds it again later
+-- Wrapped functions are remembered, so repeating this is harmless.
 -------------------------------------------------------------------
 
-local function TryHookPfUI()
-  if not pfUI or not getglobal("pfPanelWidgetClock") then return end
-  local widget_clock = getglobal("pfPanelWidgetClock")
-  if widget_clock.Old_Tooltip_tscd then return end -- already hooked
-  widget_clock.Old_Tooltip_tscd = widget_clock.Tooltip
-  widget_clock.Tooltip = function()
-    widget_clock.Old_Tooltip_tscd()
-    GameTooltip:AddLine(" ")
-    GameTooltip:AddLine(C("pink", "TradeSkillCD"))
-    local any = false
-    for prof in tradeskill_list do
-      local e = TSCD_DB[realm_name] and TSCD_DB[realm_name][player_name] and TSCD_DB[realm_name][player_name][prof]
-      if type(e) == "table" then
-        local remaining = e.ready == 0 and 0 or (e.ready - time())
-        GameTooltip:AddDoubleLine(" " .. tradeskill_list[prof].name, FormatDuration(remaining))
-        any = true
+local tscd_wrapped = {} -- set of functions that already include our lines
+
+-- Appends the cooldown list of ALL known characters to GameTooltip
+local function AppendCooldownTooltip()
+  if not TSCD_DB then return end
+  GameTooltip:AddLine(" ")
+  GameTooltip:AddLine("|cff555555TradeSkillCD") -- same muted header style pfUI uses
+  local any = false
+  local list = CollectCharacters()
+  for i = 1, table.getn(list) do
+    local entry = list[i]
+    local rows = CollectRows(entry.realm, entry.char)
+    if table.getn(rows) > 0 then
+      any = true
+      GameTooltip:AddLine(CharacterLabel(entry.realm, entry.char))
+      for r = 1, table.getn(rows) do
+        GameTooltip:AddDoubleLine("   " .. C("grey", rows[r].name), FormatDuration(rows[r].remaining))
       end
     end
-    if not any then
-      GameTooltip:AddLine(C("grey", "no data"))
-    end
-    GameTooltip:Show()
   end
+  if not any then
+    GameTooltip:AddLine(C("grey", "no data - use /tscd scan"))
+  end
+  GameTooltip:Show()
+end
+
+local function WrapTooltipFunc(fn)
+  if not fn or tscd_wrapped[fn] then return fn end
+  local wrapper = function()
+    fn()
+    AppendCooldownTooltip()
+  end
+  tscd_wrapped[wrapper] = true
+  return wrapper
+end
+
+-- Returns true once pfUI's panel exists and the hook has been applied
+local function TryHookPfUI()
+  if not (pfUI and pfUI.panel and pfUI.panel.minimap) then return false end
+  local widget = getglobal("pfPanelWidgetClock")
+  if not widget then return false end
+
+  local original = widget.Tooltip
+
+  -- 1) panel buttons that already have the clock tooltip bound
+  local candidates = {}
+  local function add(frame)
+    if frame then table.insert(candidates, frame) end
+  end
+  if pfUI.panel.left then
+    add(pfUI.panel.left.left) add(pfUI.panel.left.center) add(pfUI.panel.left.right)
+  end
+  if pfUI.panel.right then
+    add(pfUI.panel.right.left) add(pfUI.panel.right.center) add(pfUI.panel.right.right)
+  end
+  add(pfUI.panel.minimap)
+
+  for i = 1, table.getn(candidates) do
+    local frame = candidates[i]
+    if frame.GetScript then
+      local enter = frame:GetScript("OnEnter")
+      if enter and not tscd_wrapped[enter] and (frame.initialized == "time" or enter == original) then
+        frame:SetScript("OnEnter", WrapTooltipFunc(enter))
+      end
+    end
+  end
+
+  -- 2) anything that binds widget.Tooltip from now on
+  if original and not tscd_wrapped[original] then
+    widget.Tooltip = WrapTooltipFunc(original)
+  end
+  return true
+end
+
+-- pfUI builds its panel some time after login, so retry for a while
+-- (every 2s, up to ~2 minutes) until the hook could be applied.
+local pfui_hook_frame = CreateFrame("Frame")
+local pfui_hook_tries = 0
+local pfui_hook_last = 0
+
+local function StartPfUIHook()
+  if not pfUI then return end
+  pfui_hook_tries = 0
+  pfui_hook_frame:SetScript("OnUpdate", function()
+    local now = GetTime()
+    if now - pfui_hook_last < 2 then return end
+    pfui_hook_last = now
+    pfui_hook_tries = pfui_hook_tries + 1
+    local ok, done = pcall(TryHookPfUI)
+    if not ok then
+      Print(C("red", "pfUI tooltip hook failed: ") .. tostring(done))
+      this:SetScript("OnUpdate", nil)
+    elseif done or pfui_hook_tries >= 60 then
+      this:SetScript("OnUpdate", nil)
+    end
+  end)
 end
 
 -------------------------------------------------------------------
@@ -523,11 +652,15 @@ end
 
 local function HelpCommand()
   Print(C("pink", "TradeSkillCD") .. C("grey", "  v1.0"))
-  Print(C("rose", "/tscd scan") .. C("grey", "  - check profession and tool cooldowns"))
-  Print(C("rose", "/tscd status") .. C("grey", "  - show your character's cooldowns"))
-  Print(C("rose", "/tscd status all") .. C("grey", "  - show cooldowns for all known characters"))
-  Print(C("rose", "/tscd sync") .. C("grey", "  - force a SuperWoW synchronization"))
-  Print(C("rose", "/tscd chat|rw|sound") .. C("grey", "  - toggle the matching notification type"))
+  Raw("  " .. C("white", "/tscd scan") .. C("grey", "  check profession and tool cooldowns"))
+  Raw("  " .. C("white", "/tscd status") .. C("grey", "  cooldowns of all known characters"))
+  Raw("  " .. C("white", "/tscd status me") .. C("grey", "  only the current character"))
+  Raw("  " .. C("white", "/tscd sync") .. C("grey", "  force a SuperWoW synchronization"))
+  Raw("  " .. C("white", "/tscd chat") .. C("grey", ", ") .. C("white", "rw") .. C("grey", ", ") .. C("white", "sound") .. C("grey", "  toggle notification type"))
+end
+
+local function OnOff(value)
+  return value and C("green", "on") or C("red", "off")
 end
 
 local function SlashHandler(msg)
@@ -539,10 +672,10 @@ local function SlashHandler(msg)
   elseif cmd == "scan" then
     ManualCheckAll()
     Print(C("grey", "scan complete."))
-  elseif cmd == "status" then
-    PrintStatus(true)
-  elseif cmd == "status all" then
+  elseif cmd == "status" or cmd == "status all" then
     PrintStatus(false)
+  elseif cmd == "status me" then
+    PrintStatus(true)
   elseif cmd == "sync" then
     if HasSuperWoW() then
       SyncImport()
@@ -553,15 +686,15 @@ local function SlashHandler(msg)
     end
   elseif cmd == "chat" then
     TSCD_CFG.noti_chat = not TSCD_CFG.noti_chat
-    Print("chat notifications: " .. (TSCD_CFG.noti_chat and C("green", "on") or C("red", "off")))
+    Print(C("grey", "chat notifications: ") .. OnOff(TSCD_CFG.noti_chat))
   elseif cmd == "rw" then
     TSCD_CFG.noti_rw = not TSCD_CFG.noti_rw
-    Print("screen notifications: " .. (TSCD_CFG.noti_rw and C("green", "on") or C("red", "off")))
+    Print(C("grey", "screen notifications: ") .. OnOff(TSCD_CFG.noti_rw))
   elseif cmd == "sound" then
     TSCD_CFG.noti_sound = not TSCD_CFG.noti_sound
-    Print("ready sound: " .. (TSCD_CFG.noti_sound and C("green", "on") or C("red", "off")))
+    Print(C("grey", "ready sound: ") .. OnOff(TSCD_CFG.noti_sound))
   else
-    Print(C("grey", "unknown command, type ") .. C("pink", "/tscd help"))
+    Print(C("grey", "unknown command, type ") .. C("white", "/tscd help"))
   end
 end
 
@@ -594,7 +727,7 @@ local function HandleEvent()
 
     SyncImport()          -- pull in data from other accounts (if SuperWoW is present)
     ScanSpellbook()
-    TryHookPfUI()
+    StartPfUIHook()       -- optional: cooldowns in pfUI's clock tooltip
     RecomputeNextCheck()  -- establish the initial "next expiry" pointer for the ticker
     RequestBagScan()      -- pick up any tool cooldowns already active on login
 
@@ -609,7 +742,6 @@ local function HandleEvent()
 
   elseif event == "SPELLS_CHANGED" then
     ScanSpellbook()
-    TryHookPfUI()
 
   elseif event == "CHAT_MSG_LOOT" then
     OnLootMessage(arg1)

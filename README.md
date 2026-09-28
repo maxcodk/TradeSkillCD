@@ -46,10 +46,13 @@ using, which is normal Blizzard-style addon behavior.
 
 ### Optional: pfUI
 
-If you use pfUI, TradeSkillCD will automatically add a small section to
-the tooltip of pfUI's clock widget showing your cooldowns. This is
-purely a bonus — pfUI is not required, and everything below works
-identically with or without it.
+If you use pfUI, hover the **clock** in its panel: below the usual time
+information, TradeSkillCD adds the cooldowns of **all** your known
+characters (same data as `/tscd status`). This is purely a bonus — pfUI
+is not required, and everything else works identically without it.
+
+The clock has to be enabled in one of pfUI's panels (it is by default).
+The tooltip hook is applied automatically a few seconds after login.
 
 ## How to use it
 
@@ -59,8 +62,8 @@ Everything is driven through chat commands:
 |---|---|
 | `/tscd help` | Lists all available commands |
 | `/tscd scan` | Manually checks your profession and tool cooldowns right now |
-| `/tscd status` | Shows cooldowns for your **current character** |
-| `/tscd status all` | Shows cooldowns for **every character** the addon knows about (all realms/accounts it has seen) |
+| `/tscd status` | Shows cooldowns for **every character** the addon knows about (all accounts, if SuperWoW sync is on) — current character first |
+| `/tscd status me` | Shows cooldowns for the **current character** only |
 | `/tscd sync` | Forces an immediate sync with other accounts (requires SuperWoW) |
 | `/tscd chat` | Turns chat notifications on/off |
 | `/tscd rw` | Turns the on-screen (raid-warning style) "ready" notification on/off |
@@ -95,14 +98,13 @@ tracked cooldown just expired. When one does, you'll get:
 
 ## Look & feel
 
-Chat output uses a soft, muted pink/rose color scheme (a toned-down
-paladin pink, not the bright neon version) for the addon's own text —
-its name, section headers, and profession names — while cooldown
-values stay in their own functional colors (green once something's
-ready, red for anything off/failed, grey for secondary details like
-timestamps and hints). `/tscd status` prints a small header line and
-groups each character's professions underneath it when you use
-`status all`.
+Chat output is deliberately neutral: soft white and grey text, with a
+muted green for "ready" and a muted red for "off"/errors. The pink
+accent is used only for a few titles (help and status headers).
+
+`/tscd status` lists each character on its own line with their
+professions indented underneath, the current character first, then the
+rest of the current realm, then other realms.
 
 ## Troubleshooting
 
@@ -114,6 +116,9 @@ groups each character's professions underneath it when you use
 - **Cooldown looks wrong after using a Salt Shaker** — wait a couple of
   seconds after using it (it's picked up automatically), or run
   `/tscd scan` to force an immediate check.
+- **No cooldowns in the pfUI clock tooltip** — make sure the clock is
+  shown in one of pfUI's panels. If the hook fails, a red
+  `pfUI tooltip hook failed: ...` line appears in chat with the reason.
 - **Something seems broken / an error shows in chat** — the main event
   handler runs inside a safety wrapper, so a problem prints a red
   `error handling <EVENT>: ...` message with the exact reason instead
