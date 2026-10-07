@@ -8,9 +8,9 @@
    1. Fully standalone addon. Data is stored in its own SavedVariables
       file (TSCD_DB), which the client automatically writes to
       WTF/Account/<ACCOUNT>/SavedVariables/TradeSkillCD.lua.
-      No dependency on pfUI - if pfUI is installed, the addon also
-      appends the cooldown list to the tooltip of pfUI's clock widget,
-      but that is purely optional.
+      No dependency on pfUI - if pfUI is installed, hovering its clock
+      widget additionally shows the cooldown list, but that is purely
+      optional.
    2. If SuperWoW (https://github.com/balakethelock/SuperWoW) is
       installed, the addon also reads/writes a shared file through
       SuperWoW's global ImportFile/ExportFile functions. That file
@@ -27,6 +27,12 @@
       are detected automatically: bag/bank changes are watched and,
       shortly after, the addon quietly checks the tracked tool items'
       cooldown swirl and records it - no manual /tscd scan required.
+
+  Deliberately kept out, after not panning out in testing: a
+  center-screen "Raid Warning" style banner, and a login reminder that
+  re-announces every already-ready character. Both added surface area
+  without a confirmed benefit - the chat notification below is the
+  reliable path.
 --]]
 
 local ADDON_NAME  = "TradeSkillCD"
@@ -34,19 +40,15 @@ local SHARED_FILE = "TradeSkillCD_Shared" -- shared file name for ExportFile/Imp
 
 -------------------------------------------------------------------
 -- Colors / formatting
---
--- Deliberately neutral: soft whites and greys for almost everything,
--- muted green/red only where they carry meaning (ready / on / off /
--- error). The paladin-pink accent is reserved for a few titles.
 -------------------------------------------------------------------
 
 local colors = {
   pink  = "|cffe08cb4", -- accent: titles/headers only
   green = "|cff6fbf8f", -- ready / on
   red   = "|cffd9827b", -- off / error
-  white = "|cffe6e6e6", -- primary text
-  grey  = "|cff9a9a9a", -- secondary text
-  dim   = "|cff666666", -- separators, timestamps
+  white = "|cffffffff", -- primary text (pure white)
+  grey  = "|cffe0e0e0", -- secondary text (barely off-white)
+  dim   = "|cffaaaaaa", -- separators, timestamps (the only tone that reads as grey)
 }
 
 local function C(color, text)
@@ -237,11 +239,129 @@ local function RecomputeNextCheck()
   next_check_at = earliest
 end
 
+-------------------------------------------------------------------
+-- Optional HearthDB backend (https://github.com/copypasteonly/HearthDB)
+--
+-- The normal SavedVariables file is only written at logout, and each
+-- running game window holds its OWN in-memory copy loaded at ITS OWN
+-- login - so with two windows open on the same account (or two
+-- accounts via SuperWoW), whichever logs out LAST overwrites the file
+-- with a snapshot that may be missing whatever the other window saved
+-- in the meantime. That is a hard limitation of SavedVariables itself,
+-- not something fixable from pure Lua.
+--
+-- HearthDB sidesteps it entirely: it is a real SQLite database file
+-- (CustomData/TradeSkillCD.db, shared across every account on this
+-- client install, same as SuperWoW's shared file). Every cooldown
+-- change is written there immediately as its own row (one UPSERT per
+-- realm+character+profession), not as a dump of the whole table - so
+-- two windows changing two different characters simply write two
+-- different rows and never clobber each other. A short periodic
+-- refresh (see the ticker further below) also pulls in rows written by
+-- OTHER currently-running windows, so you don't even need to relog to
+-- see a second window's changes.
+--
+-- Entirely optional: if HearthDB isn't installed, everything below is
+-- skipped and the addon behaves exactly as it did before (SavedVariables
+-- + the SuperWoW shared-file sync as a same-account/cross-account
+-- best-effort fallback).
+-------------------------------------------------------------------
+
+local hdb_handle = nil
+local using_hearthdb = false
+
+local function HDB_Escape(str)
+  return (gsub(str, "'", "''"))
+end
+
+local function HDB_Upsert(realm, char, prof, ready, updated)
+  if not using_hearthdb or not hdb_handle then return end
+  local ok, err = pcall(HDB_Execute, hdb_handle,
+    "INSERT OR REPLACE INTO cooldowns (realm,character,profession,ready,updated) VALUES ('" ..
+    HDB_Escape(realm) .. "','" .. HDB_Escape(char) .. "'," .. prof .. "," .. ready .. "," .. updated .. ")")
+  if not ok then
+    Print(C("red", "HearthDB write failed: ") .. tostring(err))
+    using_hearthdb = false -- stop hammering a broken handle; falls back to plain SavedVariables
+  end
+end
+
+-- One-time: if the database is empty but we already have local data
+-- (first time HearthDB gets installed on top of an existing install),
+-- seed it so nothing already tracked gets lost.
+local function HDB_Migrate()
+  local count_rows = HDB_Query(hdb_handle, "SELECT COUNT(*) AS n FROM cooldowns")
+  local n = count_rows and count_rows[1] and tonumber(count_rows[1].n) or 0
+  if n > 0 then return end
+  for realm in TSCD_DB do
+    for char in TSCD_DB[realm] do
+      for prof in TSCD_DB[realm][char] do
+        local e = TSCD_DB[realm][char][prof]
+        if type(e) == "table" and e.ready and e.updated then
+          HDB_Upsert(realm, char, prof, e.ready, e.updated)
+        end
+      end
+    end
+  end
+end
+
+-- Pulls every row from the database and merges it into TSCD_DB (same
+-- merge-by-newest-"updated" logic used for the SuperWoW shared file).
+-- Called once at login and then periodically, so changes made by OTHER
+-- currently-running windows show up here without needing to relog.
+local function HDB_RefreshAll()
+  if not hdb_handle then return end
+  local rows = HDB_Query(hdb_handle, "SELECT realm, character, profession, ready, updated FROM cooldowns")
+  local imported = {}
+  for i = 1, table.getn(rows) do
+    local row = rows[i]
+    local prof, ready, updated = tonumber(row.profession), tonumber(row.ready), tonumber(row.updated)
+    if row.realm and row.character and prof and ready and updated then
+      imported[row.realm] = imported[row.realm] or {}
+      imported[row.realm][row.character] = imported[row.realm][row.character] or {}
+      imported[row.realm][row.character][prof] = { ready = ready, updated = updated }
+    end
+  end
+  MergeDB(imported)
+  RecomputeNextCheck()
+end
+
+-- Opens/creates the database, makes sure the table exists, migrates any
+-- pre-existing local data once, then loads everything already known.
+-- Returns true only once all of that actually succeeded.
+local function InitHearthDB()
+  if not HDB_GetVersion then return false end
+  hdb_handle = HDB_Open("TradeSkillCD.db")
+  HDB_Execute(hdb_handle, [[
+    CREATE TABLE IF NOT EXISTS cooldowns (
+      realm TEXT NOT NULL,
+      character TEXT NOT NULL,
+      profession INTEGER NOT NULL,
+      ready INTEGER NOT NULL,
+      updated INTEGER NOT NULL,
+      PRIMARY KEY (realm, character, profession)
+    )
+  ]])
+  using_hearthdb = true -- HDB_Migrate/HDB_Upsert below need this set first
+  HDB_Migrate()
+  HDB_RefreshAll()
+  return true
+end
+
+-------------------------------------------------------------------
+-- Tracks whether THIS session actually changed anything, so the
+-- SuperWoW fallback (used only when HearthDB isn't installed) does not
+-- blindly re-publish a stale snapshot at logout when nothing changed.
+-------------------------------------------------------------------
+local session_dirty = false
+
 -- Sets a cooldown "ready in X seconds from now" for the CURRENT character
 local function SetCooldown(prof_index, seconds_from_now)
   EnsurePath(realm_name, player_name)
   local now = time()
-  TSCD_DB[realm_name][player_name][prof_index] = { ready = now + seconds_from_now, updated = now }
+  local ready = now + seconds_from_now
+  TSCD_DB[realm_name][player_name][prof_index] = { ready = ready, updated = now }
+  session_dirty = true
+  HDB_Upsert(realm_name, player_name, prof_index, ready, now)
   if TSCD_CFG.noti_chat then
     Print(C("white", tradeskill_list[prof_index].name) .. C("grey", " is now on cooldown: ") .. FormatDuration(seconds_from_now))
   end
@@ -268,18 +388,20 @@ local function SetCooldownIfChanged(prof_index, seconds_from_now)
   SetCooldown(prof_index, seconds_from_now)
 end
 
--- Marks a profession as ready right now
+-- Marks a profession as ready right now and announces it in chat
+-- (and via sound, for the current character) - nothing fancier than
+-- that; see the header comment for why.
 local function MarkReady(realm, char, prof_index, announce)
+  local now = time()
   TSCD_DB[realm][char][prof_index].ready = 0
-  TSCD_DB[realm][char][prof_index].updated = time()
+  TSCD_DB[realm][char][prof_index].updated = now
+  if IsCurrent(realm, char) then session_dirty = true end
+  HDB_Upsert(realm, char, prof_index, 0, now)
   if announce then
     local who = IsCurrent(realm, char) and "" or (C("white", char) .. C("dim", " · "))
     Print(who .. C("white", tradeskill_list[prof_index].name) .. C("grey", ": ") .. C("green", "ready!"))
-    if TSCD_CFG.noti_sound then
+    if TSCD_CFG.noti_sound and IsCurrent(realm, char) then
       PlaySound("LEVELUP")
-    end
-    if TSCD_CFG.noti_rw and IsCurrent(realm, char) then
-      UIErrorsFrame:AddMessage(tradeskill_list[prof_index].name .. " ready!", 0.65, 0.9, 0.75)
     end
   end
 end
@@ -378,13 +500,21 @@ local bag_scan_pending = false
 local bag_scan_last = 0
 local bag_scan_frame = CreateFrame("Frame")
 
-bag_scan_frame:SetScript("OnUpdate", function()
+local function BagScanTick()
   if not bag_scan_pending then return end
   local now = GetTime()
   if now - bag_scan_last < BAG_SCAN_INTERVAL then return end
   bag_scan_last = now
   bag_scan_pending = false
   ManualItemCheck()
+end
+
+bag_scan_frame:SetScript("OnUpdate", function()
+  local ok, err = pcall(BagScanTick)
+  if not ok then
+    Print(C("red", "error in bag scan: ") .. tostring(err))
+    this:SetScript("OnUpdate", nil)
+  end
 end)
 
 local function RequestBagScan()
@@ -456,7 +586,39 @@ local function UpdateTicker()
   RecomputeNextCheck()
 end
 
-tick_frame:SetScript("OnUpdate", UpdateTicker)
+tick_frame:SetScript("OnUpdate", function()
+  local ok, err = pcall(UpdateTicker)
+  if not ok then
+    Print(C("red", "error in cooldown ticker: ") .. tostring(err))
+    this:SetScript("OnUpdate", nil)
+  end
+end)
+
+-------------------------------------------------------------------
+-- HearthDB live refresh
+--
+-- Only relevant with HearthDB installed: re-reads the database every
+-- HDB_REFRESH_INTERVAL seconds so changes another currently-running
+-- window makes (a different character's cooldown, for example) show up
+-- here without needing to relog. Cheap - the table only ever has a
+-- handful of rows (realms x characters x 3 professions).
+-------------------------------------------------------------------
+
+local HDB_REFRESH_INTERVAL = 20 -- seconds
+local hdb_refresh_frame = CreateFrame("Frame")
+local hdb_refresh_last = 0
+
+hdb_refresh_frame:SetScript("OnUpdate", function()
+  if not using_hearthdb then return end
+  local now = GetTime()
+  if now - hdb_refresh_last < HDB_REFRESH_INTERVAL then return end
+  hdb_refresh_last = now
+  local ok, err = pcall(HDB_RefreshAll)
+  if not ok then
+    Print(C("red", "HearthDB refresh failed: ") .. tostring(err))
+    using_hearthdb = false
+  end
+end)
 
 -------------------------------------------------------------------
 -- Character list + status output
@@ -538,11 +700,11 @@ end
 -------------------------------------------------------------------
 -- Optional pfUI integration: cooldowns in the clock widget's tooltip
 --
--- How pfUI wires that tooltip (see modules/panel.lua): the clock
--- widget's Tooltip function is bound ONCE to the panel button's
--- OnEnter script the first time the clock updates, and never re-read
--- afterwards. Replacing widget.Tooltip later therefore does nothing -
--- the already-bound OnEnter has to be wrapped instead. We do both:
+-- How pfUI wires that tooltip: the clock widget's Tooltip function is
+-- bound ONCE to the panel button's OnEnter script the first time the
+-- clock updates, and never re-read afterwards. Replacing
+-- widget.Tooltip later therefore does nothing - the already-bound
+-- OnEnter has to be wrapped instead. We do both:
 --   * wrap the OnEnter of the panel button that shows the clock
 --   * wrap widget.Tooltip too, in case something binds it again later
 -- Wrapped functions are remembered, so repeating this is harmless.
@@ -554,7 +716,7 @@ local tscd_wrapped = {} -- set of functions that already include our lines
 local function AppendCooldownTooltip()
   if not TSCD_DB then return end
   GameTooltip:AddLine(" ")
-  GameTooltip:AddLine("|cff555555TradeSkillCD") -- same muted header style pfUI uses
+  GameTooltip:AddLine("|cff555555TradeSkillCD")
   local any = false
   local list = CollectCharacters()
   for i = 1, table.getn(list) do
@@ -655,8 +817,8 @@ local function HelpCommand()
   Raw("  " .. C("white", "/tscd scan") .. C("grey", "  check profession and tool cooldowns"))
   Raw("  " .. C("white", "/tscd status") .. C("grey", "  cooldowns of all known characters"))
   Raw("  " .. C("white", "/tscd status me") .. C("grey", "  only the current character"))
-  Raw("  " .. C("white", "/tscd sync") .. C("grey", "  force a SuperWoW synchronization"))
-  Raw("  " .. C("white", "/tscd chat") .. C("grey", ", ") .. C("white", "rw") .. C("grey", ", ") .. C("white", "sound") .. C("grey", "  toggle notification type"))
+  Raw("  " .. C("white", "/tscd sync") .. C("grey", "  force a HearthDB/SuperWoW synchronization"))
+  Raw("  " .. C("white", "/tscd chat") .. C("grey", ", ") .. C("white", "sound") .. C("grey", "  toggle notification type"))
 end
 
 local function OnOff(value)
@@ -677,19 +839,23 @@ local function SlashHandler(msg)
   elseif cmd == "status me" then
     PrintStatus(true)
   elseif cmd == "sync" then
-    if HasSuperWoW() then
+    if using_hearthdb then
+      local ok, err = pcall(HDB_RefreshAll)
+      if ok then
+        Print(C("grey", "synchronization complete (HearthDB)."))
+      else
+        Print(C("red", "HearthDB refresh failed: ") .. tostring(err))
+      end
+    elseif HasSuperWoW() then
       SyncImport()
       SyncExport()
-      Print(C("grey", "synchronization complete."))
+      Print(C("grey", "synchronization complete (SuperWoW)."))
     else
-      Print(C("red", "SuperWoW not detected, synchronization unavailable."))
+      Print(C("red", "neither HearthDB nor SuperWoW detected, synchronization unavailable."))
     end
   elseif cmd == "chat" then
     TSCD_CFG.noti_chat = not TSCD_CFG.noti_chat
     Print(C("grey", "chat notifications: ") .. OnOff(TSCD_CFG.noti_chat))
-  elseif cmd == "rw" then
-    TSCD_CFG.noti_rw = not TSCD_CFG.noti_rw
-    Print(C("grey", "screen notifications: ") .. OnOff(TSCD_CFG.noti_rw))
   elseif cmd == "sound" then
     TSCD_CFG.noti_sound = not TSCD_CFG.noti_sound
     Print(C("grey", "ready sound: ") .. OnOff(TSCD_CFG.noti_sound))
@@ -718,27 +884,49 @@ main_frame:RegisterEvent("BANKFRAME_OPENED")
 local function HandleEvent()
   if event == "VARIABLES_LOADED" then
     TSCD_DB  = TSCD_DB or {}
-    TSCD_CFG = TSCD_CFG or { noti_chat = true, noti_rw = true, noti_sound = true }
+    TSCD_CFG = TSCD_CFG or { noti_chat = true, noti_sound = true }
 
   elseif event == "PLAYER_LOGIN" then
     player_name = UnitName("player")
     realm_name  = GetRealmName()
     EnsurePath(realm_name, player_name)
 
-    SyncImport()          -- pull in data from other accounts (if SuperWoW is present)
-    ScanSpellbook()
-    StartPfUIHook()       -- optional: cooldowns in pfUI's clock tooltip
-    RecomputeNextCheck()  -- establish the initial "next expiry" pointer for the ticker
-    RequestBagScan()      -- pick up any tool cooldowns already active on login
-
-    if HasSuperWoW() then
-      Print(C("grey", "SuperWoW detected - cross-account synchronization is enabled."))
-    else
-      Print(C("grey", "SuperWoW not detected - data is kept within this account only."))
+    local hdb_ok = pcall(InitHearthDB) and using_hearthdb
+    if not hdb_ok then
+      SyncImport() -- pull in data from other accounts (if SuperWoW is present)
     end
+    ScanSpellbook()
+    StartPfUIHook()        -- optional: cooldowns in pfUI's clock tooltip
+    RecomputeNextCheck()   -- establish the initial "next expiry" pointer for the ticker
+    RequestBagScan()       -- pick up any tool cooldowns already active on login
+
+    -- Delayed on purpose: printed immediately, this line tends to get
+    -- buried under other addons' own PLAYER_LOGIN chatter.
+    local sync_msg
+    if hdb_ok then
+      sync_msg = C("grey", "HearthDB detected - cooldowns sync live across accounts/windows.")
+    elseif HasSuperWoW() then
+      sync_msg = C("grey", "SuperWoW detected - cross-account synchronization is enabled.")
+    else
+      sync_msg = C("grey", "SuperWoW not detected - data is kept within this account only.")
+    end
+    local login_delay_frame = CreateFrame("Frame")
+    local login_delay_start = GetTime()
+    login_delay_frame:SetScript("OnUpdate", function()
+      if GetTime() - login_delay_start < 3 then return end
+      this:SetScript("OnUpdate", nil)
+      Print(sync_msg)
+    end)
 
   elseif event == "PLAYER_LOGOUT" then
-    SyncExport()           -- write the merged dataset back to the shared file (if SuperWoW is present)
+    -- With HearthDB, every change was already written through to the
+    -- database the moment it happened - nothing left to export.
+    if not using_hearthdb and HasSuperWoW() then
+      SyncImport()         -- merge in whatever another window/account already published
+      if session_dirty then
+        SyncExport()        -- publish OUR changes too, only if we actually made any
+      end
+    end
 
   elseif event == "SPELLS_CHANGED" then
     ScanSpellbook()

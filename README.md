@@ -28,21 +28,42 @@ character's status no matter which account you're logged into.
 
 That's it — no configuration file to edit, no other addon needed.
 
-### Optional: syncing between accounts
+### Optional: syncing between accounts/windows (HearthDB or SuperWoW)
 
-If you play several characters spread across *different* WoW accounts
-(not just different characters on one account) and want to see all of
-their cooldowns from any of them, install **SuperWoW**:
+TradeSkillCD works fine on its own. If you ever run **two game windows at
+once** (two accounts, or two instances via a multiboxing tool) and want
+both to see each other's cooldowns reliably, install one of these -
+**HearthDB is the one to pick if you can**, for the reason below.
 
-- https://github.com/balakethelock/SuperWoW
+**HearthDB (recommended for multiboxing):**
+https://github.com/copypasteonly/HearthDB
 
-Just having SuperWoW installed and running is enough — TradeSkillCD
-detects it automatically and starts syncing. Nothing needs to be
-configured in TradeSkillCD itself for this to work.
+The normal addon save file (`SavedVariables`) is only written when you
+log out, and each running window holds its own private copy in memory
+from the moment it logged in - so with two windows open, whichever one
+logs out *last* overwrites the file with a snapshot that can be missing
+whatever the other window saved in the meantime. That's a limitation of
+`SavedVariables` itself, not something an addon can work around.
 
-Without SuperWoW, the addon still works perfectly fine — it just keeps
-track of cooldowns for the characters on the account you're currently
-using, which is normal Blizzard-style addon behavior.
+HearthDB gives the addon a real shared database file instead
+(`CustomData/TradeSkillCD.db`, shared by every account on this game
+install, just like SuperWoW's shared file below). Every cooldown change
+is written there the instant it happens, one small row at a time - so
+two windows updating two different characters never overwrite each
+other, and a window left open picks up what another window did within
+about 20 seconds, no relog needed. If you had cooldowns tracked before
+installing HearthDB, they're copied in automatically the first time it
+loads.
+
+**SuperWoW (fallback, used automatically if HearthDB isn't installed):**
+https://github.com/balakethelock/SuperWoW
+
+Just having HearthDB or SuperWoW installed and running is enough -
+TradeSkillCD detects whichever one is available automatically (HearthDB
+first, SuperWoW as a fallback) and starts syncing. Nothing needs to be
+configured in TradeSkillCD itself. With neither installed, the addon
+still works perfectly fine for a single account/window - it just can't
+merge data between two windows open at the same time.
 
 ### Optional: pfUI
 
@@ -64,9 +85,8 @@ Everything is driven through chat commands:
 | `/tscd scan` | Manually checks your profession and tool cooldowns right now |
 | `/tscd status` | Shows cooldowns for **every character** the addon knows about (all accounts, if SuperWoW sync is on) — current character first |
 | `/tscd status me` | Shows cooldowns for the **current character** only |
-| `/tscd sync` | Forces an immediate sync with other accounts (requires SuperWoW) |
+| `/tscd sync` | Forces an immediate sync with other windows/accounts (HearthDB or SuperWoW) |
 | `/tscd chat` | Turns chat notifications on/off |
-| `/tscd rw` | Turns the on-screen (raid-warning style) "ready" notification on/off |
 | `/tscd sound` | Turns the "ready" sound on/off |
 
 ### When does it pick up cooldowns automatically?
@@ -93,13 +113,17 @@ Every few seconds the addon checks in the background whether any
 tracked cooldown just expired. When one does, you'll get:
 
 - a chat message (if `chat` notifications are on),
-- a centered on-screen message (if `rw` notifications are on),
-- a "level up" sound (if `sound` notifications are on).
+- a "level up" sound (if `sound` notifications are on, current character only).
+
+This fires once, exactly when a cooldown finishes. It does not repeat on
+every later login — check `/tscd status` any time to see what's
+currently ready.
 
 ## Look & feel
 
 Chat output is deliberately neutral: soft white and grey text, with a
-muted green for "ready" and a muted red for "off"/errors. 
+muted green for "ready" and a muted red for "off"/errors. The pink
+accent is used only for a few titles (help and status headers).
 
 `/tscd status` lists each character on its own line with their
 professions indented underneath, the current character first, then the
@@ -107,14 +131,22 @@ rest of the current realm, then other realms.
 
 ## Troubleshooting
 
-- **"SuperWoW not detected"** — this just means cross-account syncing is
-  off; everything else still works normally for the account you're on.
+- **"SuperWoW not detected" / no HearthDB message at login** — this just
+  means cross-window/cross-account syncing is off; everything else
+  still works normally for the account you're currently on.
 - **Nothing shows up in `/tscd status`** — run `/tscd scan` once so the
   addon can do its first check, and make sure you've actually learned
   Alchemy, Tailoring, or Leatherworking on that character.
 - **Cooldown looks wrong after using a Salt Shaker** — wait a couple of
   seconds after using it (it's picked up automatically), or run
   `/tscd scan` to force an immediate check.
+- **The chat message at login seems missing** — it's delayed a few
+  seconds on purpose so it doesn't get buried under every other addon's
+  own login spam; check chat again a moment after logging in.
+- **No "ready" notification when a cooldown finishes** — run
+  `/tscd status` to confirm the cooldown really is the one that just
+  hit zero (not one already marked ready earlier). The notification
+  only fires once, at the exact moment a tracked cooldown reaches zero.
 - **No cooldowns in the pfUI clock tooltip** — make sure the clock is
   shown in one of pfUI's panels. If the hook fails, a red
   `pfUI tooltip hook failed: ...` line appears in chat with the reason.
