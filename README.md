@@ -115,9 +115,13 @@ tracked cooldown just expired. When one does, you'll get:
 - a chat message (if `chat` notifications are on),
 - a "level up" sound (if `sound` notifications are on, current character only).
 
-This fires once, exactly when a cooldown finishes. It does not repeat on
-every later login — check `/tscd status` any time to see what's
-currently ready.
+This fires once, exactly when a cooldown finishes.
+
+On top of that, a few seconds after every login the addon lists
+everything that is currently ready, for **all** known characters (not
+just the one you logged into) — so even a character without any
+professions gets the reminder. It's a chat line only, no sound unless
+the ready cooldown belongs to the character you're playing.
 
 ## Look & feel
 
@@ -145,8 +149,14 @@ rest of the current realm, then other realms.
   own login spam; check chat again a moment after logging in.
 - **No "ready" notification when a cooldown finishes** — run
   `/tscd status` to confirm the cooldown really is the one that just
-  hit zero (not one already marked ready earlier). The notification
-  only fires once, at the exact moment a tracked cooldown reaches zero.
+  hit zero (not one already marked ready earlier). The live
+  notification fires once, at the exact moment a tracked cooldown
+  reaches zero; the login reminder covers everything ready at login.
+- **`HearthDB error (will keep retrying)` in chat** — the database
+  refused access for a moment (this can happen when two windows touch
+  it at the same time). Nothing is lost: failed writes are queued and
+  retried, and the connection is re-established automatically. The
+  message appears once per hiccup; if it keeps coming back, report it.
 - **No cooldowns in the pfUI clock tooltip** — make sure the clock is
   shown in one of pfUI's panels. If the hook fails, a red
   `pfUI tooltip hook failed: ...` line appears in chat with the reason.

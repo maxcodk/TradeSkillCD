@@ -29,10 +29,9 @@
       cooldown swirl and records it - no manual /tscd scan required.
 
   Deliberately kept out, after not panning out in testing: a
-  center-screen "Raid Warning" style banner, and a login reminder that
-  re-announces every already-ready character. Both added surface area
-  without a confirmed benefit - the chat notification below is the
-  reliable path.
+  center-screen "Raid Warning" style banner. The chat notification is
+  the reliable path. At every login, everything that is ready (all
+  known characters) is listed once in chat.
 --]]
 
 local ADDON_NAME  = "TradeSkillCD"
@@ -268,20 +267,47 @@ end
 -------------------------------------------------------------------
 
 local hdb_handle = nil
-local using_hearthdb = false
+local using_hearthdb = false   -- true once the table exists and writes can be attempted
+local hdb_wanted = false       -- HearthDB is installed (decided at login)
+local hdb_migrated = false
+local hdb_error_shown = false  -- an outage is reported once, not every few seconds
+local hdb_pending = {}         -- writes that failed; retried on the next refresh tick
 
 local function HDB_Escape(str)
   return (gsub(str, "'", "''"))
 end
 
-local function HDB_Upsert(realm, char, prof, ready, updated)
-  if not using_hearthdb or not hdb_handle then return end
-  local ok, err = pcall(HDB_Execute, hdb_handle,
+-- Raw write; raises on failure.
+local function HDB_Write(realm, char, prof, ready, updated)
+  HDB_Execute(hdb_handle,
     "INSERT OR REPLACE INTO cooldowns (realm,character,profession,ready,updated) VALUES ('" ..
     HDB_Escape(realm) .. "','" .. HDB_Escape(char) .. "'," .. prof .. "," .. ready .. "," .. updated .. ")")
-  if not ok then
-    Print(C("red", "HearthDB write failed: ") .. tostring(err))
-    using_hearthdb = false -- stop hammering a broken handle; falls back to plain SavedVariables
+end
+
+-- Write-through used by SetCooldown/MarkReady. A failed write (the
+-- database can briefly refuse access while another window is using it)
+-- is queued and retried, never dropped and never fatal.
+local function HDB_Upsert(realm, char, prof, ready, updated)
+  if not using_hearthdb or not hdb_handle then return end
+  local key = realm .. "|" .. char .. "|" .. prof
+  local ok, err = pcall(HDB_Write, realm, char, prof, ready, updated)
+  if ok then
+    hdb_pending[key] = nil
+  else
+    hdb_pending[key] = { realm = realm, char = char, prof = prof, ready = ready, updated = updated }
+    if not hdb_error_shown then
+      hdb_error_shown = true
+      Print(C("red", "HearthDB write failed (will retry): ") .. tostring(err))
+    end
+  end
+end
+
+-- Retries queued writes; raises on the first one that still fails.
+local function HDB_FlushPending()
+  for key in hdb_pending do
+    local w = hdb_pending[key]
+    HDB_Write(w.realm, w.char, w.prof, w.ready, w.updated)
+    hdb_pending[key] = nil
   end
 end
 
@@ -291,23 +317,23 @@ end
 local function HDB_Migrate()
   local count_rows = HDB_Query(hdb_handle, "SELECT COUNT(*) AS n FROM cooldowns")
   local n = count_rows and count_rows[1] and tonumber(count_rows[1].n) or 0
-  if n > 0 then return end
-  for realm in TSCD_DB do
-    for char in TSCD_DB[realm] do
-      for prof in TSCD_DB[realm][char] do
-        local e = TSCD_DB[realm][char][prof]
-        if type(e) == "table" and e.ready and e.updated then
-          HDB_Upsert(realm, char, prof, e.ready, e.updated)
+  if n == 0 then
+    for realm in TSCD_DB do
+      for char in TSCD_DB[realm] do
+        for prof in TSCD_DB[realm][char] do
+          local e = TSCD_DB[realm][char][prof]
+          if type(e) == "table" and e.ready and e.updated then
+            HDB_Upsert(realm, char, prof, e.ready, e.updated)
+          end
         end
       end
     end
   end
+  hdb_migrated = true
 end
 
 -- Pulls every row from the database and merges it into TSCD_DB (same
 -- merge-by-newest-"updated" logic used for the SuperWoW shared file).
--- Called once at login and then periodically, so changes made by OTHER
--- currently-running windows show up here without needing to relog.
 local function HDB_RefreshAll()
   if not hdb_handle then return end
   local rows = HDB_Query(hdb_handle, "SELECT realm, character, profession, ready, updated FROM cooldowns")
@@ -325,12 +351,11 @@ local function HDB_RefreshAll()
   RecomputeNextCheck()
 end
 
--- Opens/creates the database, makes sure the table exists, migrates any
--- pre-existing local data once, then loads everything already known.
--- Returns true only once all of that actually succeeded.
+-- Opens/creates the database and makes sure the table exists.
+-- Raises on failure; using_hearthdb only becomes true once it worked.
 local function InitHearthDB()
   if not HDB_GetVersion then return false end
-  hdb_handle = HDB_Open("TradeSkillCD.db")
+  hdb_handle = hdb_handle or HDB_Open("TradeSkillCD.db")
   HDB_Execute(hdb_handle, [[
     CREATE TABLE IF NOT EXISTS cooldowns (
       realm TEXT NOT NULL,
@@ -341,10 +366,24 @@ local function InitHearthDB()
       PRIMARY KEY (realm, character, profession)
     )
   ]])
-  using_hearthdb = true -- HDB_Migrate/HDB_Upsert below need this set first
-  HDB_Migrate()
-  HDB_RefreshAll()
+  using_hearthdb = true
   return true
+end
+
+-- Everything that keeps the database and the in-memory copy in step:
+-- (re)connect if needed, migrate once, retry queued writes, pull rows
+-- written by other windows. Raises on failure - callers pcall it and
+-- simply try again next time, so one bad moment never switches
+-- HearthDB off for the rest of the session.
+local function HDB_Tick(quiet)
+  if not hdb_wanted then return end
+  if not using_hearthdb then
+    InitHearthDB()
+    if not quiet then Print(C("grey", "HearthDB connected.")) end
+  end
+  if not hdb_migrated then HDB_Migrate() end
+  HDB_FlushPending()
+  HDB_RefreshAll()
 end
 
 -------------------------------------------------------------------
@@ -391,6 +430,14 @@ end
 -- Marks a profession as ready right now and announces it in chat
 -- (and via sound, for the current character) - nothing fancier than
 -- that; see the header comment for why.
+local function AnnounceReady(realm, char, prof_index)
+  local who = IsCurrent(realm, char) and "" or (C("white", char) .. C("dim", " · "))
+  Print(who .. C("white", tradeskill_list[prof_index].name) .. C("grey", ": ") .. C("green", "ready!"))
+  if TSCD_CFG.noti_sound and IsCurrent(realm, char) then
+    PlaySound("LEVELUP")
+  end
+end
+
 local function MarkReady(realm, char, prof_index, announce)
   local now = time()
   TSCD_DB[realm][char][prof_index].ready = 0
@@ -398,10 +445,38 @@ local function MarkReady(realm, char, prof_index, announce)
   if IsCurrent(realm, char) then session_dirty = true end
   HDB_Upsert(realm, char, prof_index, 0, now)
   if announce then
-    local who = IsCurrent(realm, char) and "" or (C("white", char) .. C("dim", " · "))
-    Print(who .. C("white", tradeskill_list[prof_index].name) .. C("grey", ": ") .. C("green", "ready!"))
-    if TSCD_CFG.noti_sound and IsCurrent(realm, char) then
-      PlaySound("LEVELUP")
+    AnnounceReady(realm, char, prof_index)
+  end
+end
+
+-- Login helpers. Cooldowns that ran out while we were offline are first
+-- marked ready silently (so the ticker doesn't announce them a second
+-- time), then everything that is ready - for EVERY known character, not
+-- just the one being played - is listed once in chat. That is what makes
+-- a character without any professions still show the reminder.
+local function MarkExpiredSilently()
+  local rt = time()
+  for realm in TSCD_DB do
+    for char in TSCD_DB[realm] do
+      for prof in TSCD_DB[realm][char] do
+        local e = TSCD_DB[realm][char][prof]
+        if type(e) == "table" and e.ready and e.ready ~= 0 and e.ready <= rt then
+          MarkReady(realm, char, prof, false)
+        end
+      end
+    end
+  end
+end
+
+local function AnnounceReadyOnLogin()
+  for realm in TSCD_DB do
+    for char in TSCD_DB[realm] do
+      for prof = 1, table.getn(tradeskill_list) do
+        local e = TSCD_DB[realm][char][prof]
+        if type(e) == "table" and e.ready == 0 then
+          AnnounceReady(realm, char, prof)
+        end
+      end
     end
   end
 end
@@ -609,14 +684,16 @@ local hdb_refresh_frame = CreateFrame("Frame")
 local hdb_refresh_last = 0
 
 hdb_refresh_frame:SetScript("OnUpdate", function()
-  if not using_hearthdb then return end
+  if not hdb_wanted then return end
   local now = GetTime()
   if now - hdb_refresh_last < HDB_REFRESH_INTERVAL then return end
   hdb_refresh_last = now
-  local ok, err = pcall(HDB_RefreshAll)
-  if not ok then
-    Print(C("red", "HearthDB refresh failed: ") .. tostring(err))
-    using_hearthdb = false
+  local ok, err = pcall(HDB_Tick)
+  if ok then
+    hdb_error_shown = false
+  elseif not hdb_error_shown then
+    hdb_error_shown = true
+    Print(C("red", "HearthDB error (will keep retrying): ") .. tostring(err))
   end
 end)
 
@@ -839,12 +916,12 @@ local function SlashHandler(msg)
   elseif cmd == "status me" then
     PrintStatus(true)
   elseif cmd == "sync" then
-    if using_hearthdb then
-      local ok, err = pcall(HDB_RefreshAll)
+    if hdb_wanted then
+      local ok, err = pcall(HDB_Tick, true)
       if ok then
         Print(C("grey", "synchronization complete (HearthDB)."))
       else
-        Print(C("red", "HearthDB refresh failed: ") .. tostring(err))
+        Print(C("red", "HearthDB error: ") .. tostring(err))
       end
     elseif HasSuperWoW() then
       SyncImport()
@@ -891,10 +968,17 @@ local function HandleEvent()
     realm_name  = GetRealmName()
     EnsurePath(realm_name, player_name)
 
-    local hdb_ok = pcall(InitHearthDB) and using_hearthdb
+    hdb_wanted = (HDB_GetVersion ~= nil)
+    local hdb_ok = false
+    if hdb_wanted then
+      pcall(HDB_Tick, true)          -- a failure here is retried by the refresh timer
+      hdb_ok = using_hearthdb
+      hdb_refresh_last = GetTime()   -- don't query again immediately
+    end
     if not hdb_ok then
       SyncImport() -- pull in data from other accounts (if SuperWoW is present)
     end
+    MarkExpiredSilently()
     ScanSpellbook()
     StartPfUIHook()        -- optional: cooldowns in pfUI's clock tooltip
     RecomputeNextCheck()   -- establish the initial "next expiry" pointer for the ticker
@@ -905,6 +989,8 @@ local function HandleEvent()
     local sync_msg
     if hdb_ok then
       sync_msg = C("grey", "HearthDB detected - cooldowns sync live across accounts/windows.")
+    elseif hdb_wanted then
+      sync_msg = C("grey", "HearthDB found but not responding - retrying in the background.")
     elseif HasSuperWoW() then
       sync_msg = C("grey", "SuperWoW detected - cross-account synchronization is enabled.")
     else
@@ -915,13 +1001,16 @@ local function HandleEvent()
     login_delay_frame:SetScript("OnUpdate", function()
       if GetTime() - login_delay_start < 3 then return end
       this:SetScript("OnUpdate", nil)
+      AnnounceReadyOnLogin()
       Print(sync_msg)
     end)
 
   elseif event == "PLAYER_LOGOUT" then
     -- With HearthDB, every change was already written through to the
     -- database the moment it happened - nothing left to export.
-    if not using_hearthdb and HasSuperWoW() then
+    if using_hearthdb then
+      pcall(HDB_FlushPending)  -- last chance for any write that failed earlier
+    elseif HasSuperWoW() then
       SyncImport()         -- merge in whatever another window/account already published
       if session_dirty then
         SyncExport()        -- publish OUR changes too, only if we actually made any
